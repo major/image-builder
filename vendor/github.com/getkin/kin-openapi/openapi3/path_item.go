@@ -2,14 +2,18 @@ package openapi3
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
-
-	"github.com/getkin/kin-openapi/jsoninfo"
 )
 
+// PathItem is specified by OpenAPI/Swagger standard version 3.
+// See https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.0.3.md#path-item-object
 type PathItem struct {
-	ExtensionProps
+	Extensions map[string]any `json:"-" yaml:"-"`
+	Origin     *Origin        `json:"-" yaml:"-"`
+
 	Ref         string     `json:"$ref,omitempty" yaml:"$ref,omitempty"`
 	Summary     string     `json:"summary,omitempty" yaml:"summary,omitempty"`
 	Description string     `json:"description,omitempty" yaml:"description,omitempty"`
@@ -26,16 +30,96 @@ type PathItem struct {
 	Parameters  Parameters `json:"parameters,omitempty" yaml:"parameters,omitempty"`
 }
 
-func (pathItem *PathItem) MarshalJSON() ([]byte, error) {
-	return jsoninfo.MarshalStrictStruct(pathItem)
+// MarshalJSON returns the JSON encoding of PathItem.
+func (pathItem PathItem) MarshalJSON() ([]byte, error) {
+	x, err := pathItem.MarshalYAML()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(x)
 }
 
+// MarshalYAML returns the YAML encoding of PathItem.
+func (pathItem PathItem) MarshalYAML() (any, error) {
+	if ref := pathItem.Ref; ref != "" {
+		return Ref{Ref: ref}, nil
+	}
+
+	m := make(map[string]any, 13+len(pathItem.Extensions))
+	maps.Copy(m, pathItem.Extensions)
+	if x := pathItem.Summary; x != "" {
+		m["summary"] = x
+	}
+	if x := pathItem.Description; x != "" {
+		m["description"] = x
+	}
+	if x := pathItem.Connect; x != nil {
+		m["connect"] = x
+	}
+	if x := pathItem.Delete; x != nil {
+		m["delete"] = x
+	}
+	if x := pathItem.Get; x != nil {
+		m["get"] = x
+	}
+	if x := pathItem.Head; x != nil {
+		m["head"] = x
+	}
+	if x := pathItem.Options; x != nil {
+		m["options"] = x
+	}
+	if x := pathItem.Patch; x != nil {
+		m["patch"] = x
+	}
+	if x := pathItem.Post; x != nil {
+		m["post"] = x
+	}
+	if x := pathItem.Put; x != nil {
+		m["put"] = x
+	}
+	if x := pathItem.Trace; x != nil {
+		m["trace"] = x
+	}
+	if x := pathItem.Servers; len(x) != 0 {
+		m["servers"] = x
+	}
+	if x := pathItem.Parameters; len(x) != 0 {
+		m["parameters"] = x
+	}
+	return m, nil
+}
+
+// UnmarshalJSON sets PathItem to a copy of data.
 func (pathItem *PathItem) UnmarshalJSON(data []byte) error {
-	return jsoninfo.UnmarshalStrictStruct(data, pathItem)
+	type PathItemBis PathItem
+	var x PathItemBis
+	if err := json.Unmarshal(data, &x); err != nil {
+		return unmarshalError(err)
+	}
+	_ = json.Unmarshal(data, &x.Extensions)
+	delete(x.Extensions, "$ref")
+	delete(x.Extensions, "summary")
+	delete(x.Extensions, "description")
+	delete(x.Extensions, "connect")
+	delete(x.Extensions, "delete")
+	delete(x.Extensions, "get")
+	delete(x.Extensions, "head")
+	delete(x.Extensions, "options")
+	delete(x.Extensions, "patch")
+	delete(x.Extensions, "post")
+	delete(x.Extensions, "put")
+	delete(x.Extensions, "trace")
+	delete(x.Extensions, "servers")
+	delete(x.Extensions, "parameters")
+	if len(x.Extensions) == 0 {
+		x.Extensions = nil
+	}
+	*pathItem = PathItem(x)
+	return nil
 }
 
 func (pathItem *PathItem) Operations() map[string]*Operation {
-	operations := make(map[string]*Operation, 4)
+	operations := make(map[string]*Operation)
 	if v := pathItem.Connect; v != nil {
 		operations[http.MethodConnect] = v
 	}
@@ -87,7 +171,7 @@ func (pathItem *PathItem) GetOperation(method string) *Operation {
 	case http.MethodTrace:
 		return pathItem.Trace
 	default:
-		panic(fmt.Errorf("Unsupported HTTP method '%s'", method))
+		panic(fmt.Errorf("unsupported HTTP method %q", method))
 	}
 }
 
@@ -112,15 +196,49 @@ func (pathItem *PathItem) SetOperation(method string, operation *Operation) {
 	case http.MethodTrace:
 		pathItem.Trace = operation
 	default:
-		panic(fmt.Errorf("Unsupported HTTP method '%s'", method))
+		panic(fmt.Errorf("unsupported HTTP method %q", method))
 	}
 }
 
-func (pathItem *PathItem) Validate(c context.Context) error {
-	for _, operation := range pathItem.Operations() {
-		if err := operation.Validate(c); err != nil {
+// Validate returns an error if PathItem does not comply with the OpenAPI spec.
+func (pathItem *PathItem) Validate(ctx context.Context, opts ...ValidationOption) error {
+	ctx = WithValidationOptions(ctx, opts...)
+	me := newErrCollector(ctx)
+
+	operations := pathItem.Operations()
+
+	for _, method := range componentNames(operations) {
+		operation := operations[method]
+		wrapOp := func(e error) error { return &OperationValidationError{Method: method, Cause: e} }
+		if err := me.emitWrapped(wrapOp, operation.Validate(ctx)); err != nil {
 			return err
 		}
 	}
-	return nil
+
+	if v := pathItem.Parameters; v != nil {
+		if err := me.emit(v.Validate(ctx)); err != nil {
+			return err
+		}
+	}
+
+	return me.finalize(validateExtensions(ctx, pathItem.Extensions, pathItem.Origin))
+}
+
+// isEmpty's introduced in 546590b1
+func (pathItem *PathItem) isEmpty() bool {
+	// NOTE: ignores pathItem.Extensions
+	// NOTE: ignores pathItem.Ref
+	return pathItem.Summary == "" &&
+		pathItem.Description == "" &&
+		pathItem.Connect == nil &&
+		pathItem.Delete == nil &&
+		pathItem.Get == nil &&
+		pathItem.Head == nil &&
+		pathItem.Options == nil &&
+		pathItem.Patch == nil &&
+		pathItem.Post == nil &&
+		pathItem.Put == nil &&
+		pathItem.Trace == nil &&
+		len(pathItem.Servers) == 0 &&
+		len(pathItem.Parameters) == 0
 }
