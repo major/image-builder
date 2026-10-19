@@ -2,16 +2,19 @@ package openapi3
 
 import (
 	"context"
-	"errors"
-	"fmt"
-
-	"github.com/getkin/kin-openapi/jsoninfo"
+	"encoding/json"
+	"maps"
 )
 
-// Info is specified by OpenAPI/Swagger standard version 3.0.
+// Info is specified by OpenAPI/Swagger standard version 3.
+// See https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.0.3.md#info-object
+// and https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.1.0.md#info-object
 type Info struct {
-	ExtensionProps
-	Title          string   `json:"title" yaml:"title"` // Required
+	Extensions map[string]any `json:"-" yaml:"-"`
+	Origin     *Origin        `json:"-" yaml:"-"`
+
+	Title          string   `json:"title" yaml:"title"`                         // Required
+	Summary        string   `json:"summary,omitempty" yaml:"summary,omitempty"` // OpenAPI >=3.1
 	Description    string   `json:"description,omitempty" yaml:"description,omitempty"`
 	TermsOfService string   `json:"termsOfService,omitempty" yaml:"termsOfService,omitempty"`
 	Contact        *Contact `json:"contact,omitempty" yaml:"contact,omitempty"`
@@ -19,76 +22,98 @@ type Info struct {
 	Version        string   `json:"version" yaml:"version"` // Required
 }
 
-func (value *Info) MarshalJSON() ([]byte, error) {
-	return jsoninfo.MarshalStrictStruct(value)
+// MarshalJSON returns the JSON encoding of Info.
+func (info Info) MarshalJSON() ([]byte, error) {
+	x, err := info.MarshalYAML()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(x)
 }
 
-func (value *Info) UnmarshalJSON(data []byte) error {
-	return jsoninfo.UnmarshalStrictStruct(data, value)
+// MarshalYAML returns the YAML encoding of Info.
+func (info *Info) MarshalYAML() (any, error) {
+	if info == nil {
+		return nil, nil
+	}
+	m := make(map[string]any, 7+len(info.Extensions))
+	maps.Copy(m, info.Extensions)
+	m["title"] = info.Title
+	if x := info.Summary; x != "" {
+		m["summary"] = x
+	}
+	if x := info.Description; x != "" {
+		m["description"] = x
+	}
+	if x := info.TermsOfService; x != "" {
+		m["termsOfService"] = x
+	}
+	if x := info.Contact; x != nil {
+		m["contact"] = x
+	}
+	if x := info.License; x != nil {
+		m["license"] = x
+	}
+	m["version"] = info.Version
+	return m, nil
 }
 
-func (value *Info) Validate(c context.Context) error {
-	if contact := value.Contact; contact != nil {
-		if err := contact.Validate(c); err != nil {
-			return fmt.Errorf("Error when validating Contact: %s", err.Error())
+// UnmarshalJSON sets Info to a copy of data.
+func (info *Info) UnmarshalJSON(data []byte) error {
+	type InfoBis Info
+	var x InfoBis
+	if err := json.Unmarshal(data, &x); err != nil {
+		return unmarshalError(err)
+	}
+	_ = json.Unmarshal(data, &x.Extensions)
+	delete(x.Extensions, "title")
+	delete(x.Extensions, "summary")
+	delete(x.Extensions, "description")
+	delete(x.Extensions, "termsOfService")
+	delete(x.Extensions, "contact")
+	delete(x.Extensions, "license")
+	delete(x.Extensions, "version")
+	if len(x.Extensions) == 0 {
+		x.Extensions = nil
+	}
+	*info = Info(x)
+	return nil
+}
+
+// Validate returns an error if Info does not comply with the OpenAPI spec.
+func (info *Info) Validate(ctx context.Context, opts ...ValidationOption) error {
+	ctx = WithValidationOptions(ctx, opts...)
+	me := newErrCollector(ctx)
+
+	if info.Summary != "" && !getValidationOptions(ctx).isOpenAPI31OrLater {
+		if err := me.emit(newInfoSummaryFieldFor31Plus(info.Origin)); err != nil {
+			return err
 		}
 	}
 
-	if license := value.License; license != nil {
-		if err := license.Validate(c); err != nil {
-			return fmt.Errorf("Error when validating License: %s", err.Error())
+	if contact := info.Contact; contact != nil {
+		if err := me.emit(contact.Validate(ctx)); err != nil {
+			return err
 		}
 	}
 
-	if value.Version == "" {
-		return errors.New("Variable 'version' must be a non-empty JSON string")
+	if license := info.License; license != nil {
+		if err := me.emit(license.Validate(ctx)); err != nil {
+			return err
+		}
 	}
 
-	if value.Title == "" {
-		return errors.New("Variable 'title' must be a non-empty JSON string")
+	if info.Version == "" {
+		if err := me.emit(newInfoVersionRequired(info.Origin)); err != nil {
+			return err
+		}
 	}
 
-	return nil
-}
-
-// Contact is specified by OpenAPI/Swagger standard version 3.0.
-type Contact struct {
-	ExtensionProps
-	Name  string `json:"name,omitempty" yaml:"name,omitempty"`
-	URL   string `json:"url,omitempty" yaml:"url,omitempty"`
-	Email string `json:"email,omitempty" yaml:"email,omitempty"`
-}
-
-func (value *Contact) MarshalJSON() ([]byte, error) {
-	return jsoninfo.MarshalStrictStruct(value)
-}
-
-func (value *Contact) UnmarshalJSON(data []byte) error {
-	return jsoninfo.UnmarshalStrictStruct(data, value)
-}
-
-func (value *Contact) Validate(c context.Context) error {
-	return nil
-}
-
-// License is specified by OpenAPI/Swagger standard version 3.0.
-type License struct {
-	ExtensionProps
-	Name string `json:"name" yaml:"name"` // Required
-	URL  string `json:"url,omitempty" yaml:"url,omitempty"`
-}
-
-func (value *License) MarshalJSON() ([]byte, error) {
-	return jsoninfo.MarshalStrictStruct(value)
-}
-
-func (value *License) UnmarshalJSON(data []byte) error {
-	return jsoninfo.UnmarshalStrictStruct(data, value)
-}
-
-func (value *License) Validate(c context.Context) error {
-	if value.Name == "" {
-		return errors.New("Variable 'name' must be a non-empty JSON string")
+	if info.Title == "" {
+		if err := me.emit(newInfoTitleRequired(info.Origin)); err != nil {
+			return err
+		}
 	}
-	return nil
+
+	return me.finalize(validateExtensions(ctx, info.Extensions, info.Origin))
 }
