@@ -2,14 +2,35 @@ package openapi3
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
+	"maps"
+	"strconv"
 
-	"github.com/getkin/kin-openapi/jsoninfo"
+	"github.com/go-openapi/jsonpointer"
 )
 
 // Parameters is specified by OpenAPI/Swagger 3.0 standard.
 type Parameters []*ParameterRef
+
+var _ jsonpointer.JSONPointable = (*Parameters)(nil)
+
+// JSONLookup implements https://pkg.go.dev/github.com/go-openapi/jsonpointer#JSONPointable
+func (p Parameters) JSONLookup(token string) (any, error) {
+	index, err := strconv.Atoi(token)
+	if err != nil {
+		return nil, err
+	}
+	if index < 0 || index >= len(p) {
+		return nil, fmt.Errorf("index %d out of bounds of array of length %d", index, len(p))
+	}
+
+	ref := p[index]
+	if ref != nil && ref.Ref != "" {
+		return &Ref{Ref: ref.Ref}, nil
+	}
+	return ref.Value, nil
+}
 
 func NewParameters() Parameters {
 	return make(Parameters, 0, 4)
@@ -26,45 +47,49 @@ func (parameters Parameters) GetByInAndName(in string, name string) *Parameter {
 	return nil
 }
 
-func (parameters Parameters) Validate(c context.Context) error {
-	m := make(map[string]struct{})
-	for _, item := range parameters {
-		if err := item.Validate(c); err != nil {
-			return err
+// Validate returns an error if Parameters does not comply with the OpenAPI spec.
+func (parameters Parameters) Validate(ctx context.Context, opts ...ValidationOption) error {
+	ctx = WithValidationOptions(ctx, opts...)
+
+	dupes := make(map[string]struct{})
+	for _, parameterRef := range parameters {
+		if v := parameterRef.Value; v != nil {
+			key := v.In + ":" + v.Name
+			if _, ok := dupes[key]; ok {
+				return newDuplicateParameter(v.In, v.Name, v.Origin)
+			}
+			dupes[key] = struct{}{}
 		}
-		if v := item.Value; v != nil {
-			in := v.In
-			name := v.Name
-			key := in + ":" + name
-			if _, exists := m[key]; exists {
-				return fmt.Errorf("More than one '%s' parameter has name '%s'", in, name)
-			}
-			m[key] = struct{}{}
-			if err := item.Validate(c); err != nil {
-				return err
-			}
+
+		if err := parameterRef.Validate(ctx); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 // Parameter is specified by OpenAPI/Swagger 3.0 standard.
+// See https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.0.3.md#parameter-object
 type Parameter struct {
-	ExtensionProps
-	Name            string                 `json:"name,omitempty" yaml:"name,omitempty"`
-	In              string                 `json:"in,omitempty" yaml:"in,omitempty"`
-	Description     string                 `json:"description,omitempty" yaml:"description,omitempty"`
-	Style           string                 `json:"style,omitempty" yaml:"style,omitempty"`
-	Explode         *bool                  `json:"explode,omitempty" yaml:"explode,omitempty"`
-	AllowEmptyValue bool                   `json:"allowEmptyValue,omitempty" yaml:"allowEmptyValue,omitempty"`
-	AllowReserved   bool                   `json:"allowReserved,omitempty" yaml:"allowReserved,omitempty"`
-	Deprecated      bool                   `json:"deprecated,omitempty" yaml:"deprecated,omitempty"`
-	Required        bool                   `json:"required,omitempty" yaml:"required,omitempty"`
-	Schema          *SchemaRef             `json:"schema,omitempty" yaml:"schema,omitempty"`
-	Example         interface{}            `json:"example,omitempty" yaml:"example,omitempty"`
-	Examples        map[string]*ExampleRef `json:"examples,omitempty" yaml:"examples,omitempty"`
-	Content         Content                `json:"content,omitempty" yaml:"content,omitempty"`
+	Extensions map[string]any `json:"-" yaml:"-"`
+	Origin     *Origin        `json:"-" yaml:"-"`
+
+	Name            string     `json:"name,omitempty" yaml:"name,omitempty"`
+	In              string     `json:"in,omitempty" yaml:"in,omitempty"`
+	Description     string     `json:"description,omitempty" yaml:"description,omitempty"`
+	Style           string     `json:"style,omitempty" yaml:"style,omitempty"`
+	Explode         *bool      `json:"explode,omitempty" yaml:"explode,omitempty"`
+	AllowEmptyValue bool       `json:"allowEmptyValue,omitempty" yaml:"allowEmptyValue,omitempty"`
+	AllowReserved   bool       `json:"allowReserved,omitempty" yaml:"allowReserved,omitempty"`
+	Deprecated      bool       `json:"deprecated,omitempty" yaml:"deprecated,omitempty"`
+	Required        bool       `json:"required,omitempty" yaml:"required,omitempty"`
+	Schema          *SchemaRef `json:"schema,omitempty" yaml:"schema,omitempty"`
+	Example         any        `json:"example,omitempty" yaml:"example,omitempty"`
+	Examples        Examples   `json:"examples,omitempty" yaml:"examples,omitempty"`
+	Content         Content    `json:"content,omitempty" yaml:"content,omitempty"`
 }
+
+var _ jsonpointer.JSONPointable = (*Parameter)(nil)
 
 const (
 	ParameterInPath   = "path"
@@ -123,12 +148,131 @@ func (parameter *Parameter) WithSchema(value *Schema) *Parameter {
 	return parameter
 }
 
-func (parameter *Parameter) MarshalJSON() ([]byte, error) {
-	return jsoninfo.MarshalStrictStruct(parameter)
+// MarshalJSON returns the JSON encoding of Parameter.
+func (parameter Parameter) MarshalJSON() ([]byte, error) {
+	x, err := parameter.MarshalYAML()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(x)
 }
 
+// MarshalYAML returns the YAML encoding of Parameter.
+func (parameter Parameter) MarshalYAML() (any, error) {
+	m := make(map[string]any, 13+len(parameter.Extensions))
+	maps.Copy(m, parameter.Extensions)
+
+	if x := parameter.Name; x != "" {
+		m["name"] = x
+	}
+	if x := parameter.In; x != "" {
+		m["in"] = x
+	}
+	if x := parameter.Description; x != "" {
+		m["description"] = x
+	}
+	if x := parameter.Style; x != "" {
+		m["style"] = x
+	}
+	if x := parameter.Explode; x != nil {
+		m["explode"] = x
+	}
+	if x := parameter.AllowEmptyValue; x {
+		m["allowEmptyValue"] = x
+	}
+	if x := parameter.AllowReserved; x {
+		m["allowReserved"] = x
+	}
+	if x := parameter.Deprecated; x {
+		m["deprecated"] = x
+	}
+	if x := parameter.Required; x {
+		m["required"] = x
+	}
+	if x := parameter.Schema; x != nil {
+		m["schema"] = x
+	}
+	if x := parameter.Example; x != nil {
+		m["example"] = x
+	}
+	if x := parameter.Examples; len(x) != 0 {
+		m["examples"] = x
+	}
+	if x := parameter.Content; len(x) != 0 {
+		m["content"] = x
+	}
+
+	return m, nil
+}
+
+// UnmarshalJSON sets Parameter to a copy of data.
 func (parameter *Parameter) UnmarshalJSON(data []byte) error {
-	return jsoninfo.UnmarshalStrictStruct(data, parameter)
+	type ParameterBis Parameter
+	var x ParameterBis
+	if err := json.Unmarshal(data, &x); err != nil {
+		return unmarshalError(err)
+	}
+	_ = json.Unmarshal(data, &x.Extensions)
+
+	delete(x.Extensions, "name")
+	delete(x.Extensions, "in")
+	delete(x.Extensions, "description")
+	delete(x.Extensions, "style")
+	delete(x.Extensions, "explode")
+	delete(x.Extensions, "allowEmptyValue")
+	delete(x.Extensions, "allowReserved")
+	delete(x.Extensions, "deprecated")
+	delete(x.Extensions, "required")
+	delete(x.Extensions, "schema")
+	delete(x.Extensions, "example")
+	delete(x.Extensions, "examples")
+	delete(x.Extensions, "content")
+	if len(x.Extensions) == 0 {
+		x.Extensions = nil
+	}
+
+	*parameter = Parameter(x)
+	return nil
+}
+
+// JSONLookup implements https://pkg.go.dev/github.com/go-openapi/jsonpointer#JSONPointable
+func (parameter Parameter) JSONLookup(token string) (any, error) {
+	switch token {
+	case "schema":
+		if parameter.Schema != nil {
+			if parameter.Schema.Ref != "" {
+				return &Ref{Ref: parameter.Schema.Ref}, nil
+			}
+			return parameter.Schema.Value, nil
+		}
+	case "name":
+		return parameter.Name, nil
+	case "in":
+		return parameter.In, nil
+	case "description":
+		return parameter.Description, nil
+	case "style":
+		return parameter.Style, nil
+	case "explode":
+		return parameter.Explode, nil
+	case "allowEmptyValue":
+		return parameter.AllowEmptyValue, nil
+	case "allowReserved":
+		return parameter.AllowReserved, nil
+	case "deprecated":
+		return parameter.Deprecated, nil
+	case "required":
+		return parameter.Required, nil
+	case "example":
+		return parameter.Example, nil
+	case "examples":
+		return parameter.Examples, nil
+	case "content":
+		return parameter.Content, nil
+	}
+
+	v, _, err := jsonpointer.GetForToken(parameter.Extensions, token)
+	return v, err
 }
 
 // SerializationMethod returns a parameter's serialization method.
@@ -161,9 +305,12 @@ func (parameter *Parameter) SerializationMethod() (*SerializationMethod, error) 
 	}
 }
 
-func (parameter *Parameter) Validate(c context.Context) error {
+// Validate returns an error if Parameter does not comply with the OpenAPI spec.
+func (parameter *Parameter) Validate(ctx context.Context, opts ...ValidationOption) error {
+	ctx = WithValidationOptions(ctx, opts...)
+
 	if parameter.Name == "" {
-		return errors.New("Parameter name can't be blank")
+		return newParameterNameRequired(parameter.Origin)
 	}
 	in := parameter.In
 	switch in {
@@ -173,7 +320,11 @@ func (parameter *Parameter) Validate(c context.Context) error {
 		ParameterInHeader,
 		ParameterInCookie:
 	default:
-		return fmt.Errorf("Parameter can't have 'in' value '%s'", parameter.In)
+		return newInvalidParameterIn(parameter.In, parameter.Origin)
+	}
+
+	if in == ParameterInPath && !parameter.Required {
+		return newPathParameterRequired(parameter.Name, parameter.Origin)
 	}
 
 	// Validate a parameter's serialization method.
@@ -206,27 +357,55 @@ func (parameter *Parameter) Validate(c context.Context) error {
 		smSupported = true
 	}
 	if !smSupported {
-		e := fmt.Errorf("Serialization method with style=%q and explode=%v is not supported by a %s parameter", sm.Style, sm.Explode, in)
-		return fmt.Errorf("Parameter '%v' schema is invalid: %v", parameter.Name, e)
+		e := newInvalidSerializationMethod(in, sm.Style, sm.Explode, parameter.Origin)
+		return &ParameterFieldValidationError{ParameterName: parameter.Name, Field: "schema", Cause: e}
 	}
 
-	if parameter.Schema != nil && parameter.Content != nil {
-		return fmt.Errorf("Parameter '%v' schema is invalid: %v", parameter.Name,
-			errors.New("Cannot contain both schema and content in a parameter"))
+	if (parameter.Schema == nil) == (len(parameter.Content) == 0) {
+		return &ParameterFieldValidationError{ParameterName: parameter.Name, Field: "schema",
+			Cause: newParameterContentSchemaExactlyOne(parameter.Origin)}
 	}
-	if parameter.Schema == nil && parameter.Content == nil {
-		return fmt.Errorf("Parameter '%v' schema is invalid: %v", parameter.Name,
-			errors.New("A parameter MUST contain either a schema property, or a content property"))
-	}
-	if schema := parameter.Schema; schema != nil {
-		if err := schema.Validate(c); err != nil {
-			return fmt.Errorf("Parameter '%v' schema is invalid: %v", parameter.Name, err)
-		}
-	}
+
 	if content := parameter.Content; content != nil {
-		if err := content.Validate(c); err != nil {
-			return fmt.Errorf("Parameter content is invalid: %v", err)
+		if len(content) > 1 {
+			return &ParameterFieldValidationError{ParameterName: parameter.Name, Field: "content",
+				Cause: newParameterContentSingleEntry(parameter.Origin)}
+		}
+
+		if err := content.Validate(ctx); err != nil {
+			return &ParameterFieldValidationError{ParameterName: parameter.Name, Field: "content", Cause: err}
 		}
 	}
-	return nil
+
+	if schema := parameter.Schema; schema != nil {
+		if err := schema.Validate(ctx); err != nil {
+			return &ParameterFieldValidationError{ParameterName: parameter.Name, Field: "schema", Cause: err}
+		}
+		if parameter.Example != nil && parameter.Examples != nil {
+			return newParameterExampleAndExamplesExclusive(parameter.Name, parameter.Origin)
+		}
+
+		if vo := getValidationOptions(ctx); vo.examplesValidationDisabled {
+			return nil
+		}
+		if example := parameter.Example; example != nil {
+			if err := validateExampleValue(ctx, example, schema.Value); err != nil {
+				return newSchemaValueError("example", err, parameter.Origin)
+			}
+		} else if examples := parameter.Examples; examples != nil {
+			for _, k := range componentNames(examples) {
+				v := examples[k]
+				if err := v.Validate(ctx); err != nil {
+					return &ParameterExampleValidationError{ExampleName: k, Cause: err}
+				}
+				if err := validateExampleValue(ctx, v.Value.Value, schema.Value); err != nil {
+					return newSchemaValueError("example",
+						&ParameterExampleValidationError{ExampleName: k, Cause: err},
+						exampleValueOrigin(v.Value, parameter.Origin))
+				}
+			}
+		}
+	}
+
+	return validateExtensions(ctx, parameter.Extensions, parameter.Origin)
 }

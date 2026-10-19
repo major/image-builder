@@ -1,38 +1,36 @@
 package openapi3
 
 import (
-	"github.com/getkin/kin-openapi/jsoninfo"
+	"context"
+	"strings"
 )
 
-// ExtensionProps provides support for OpenAPI extensions.
-// It reads/writes all properties that begin with "x-".
-type ExtensionProps struct {
-	Extensions map[string]interface{} `json:"-" yaml:"-"`
-}
+// validateExtensions reports any non-`x-` keys in the given extensions
+// map that are not explicitly allowed by the validation context. The
+// origin argument is attached to the resulting ExtraSiblingFieldsError
+// so callers can pin the finding to the parent object that carries the
+// unknown keys; pass nil when the parent has no Origin (the loader was
+// run with IncludeOrigin = false, or the parent was constructed
+// programmatically without an Origin set).
+func validateExtensions(ctx context.Context, extensions map[string]any, origin *Origin) error { // FIXME: newtype + Validate(...)
+	allowed := getValidationOptions(ctx).extraSiblingFieldsAllowed
 
-// Assert that the type implements the interface
-var _ jsoninfo.StrictStruct = &ExtensionProps{}
-
-// EncodeWith will be invoked by package "jsoninfo"
-func (props *ExtensionProps) EncodeWith(encoder *jsoninfo.ObjectEncoder, value interface{}) error {
-	for k, v := range props.Extensions {
-		if err := encoder.EncodeExtension(k, v); err != nil {
-			return err
+	var unknowns []string
+	for _, k := range componentNames(extensions) {
+		if strings.HasPrefix(k, "x-") {
+			continue
 		}
+		if allowed != nil {
+			if _, ok := allowed[k]; ok {
+				continue
+			}
+		}
+		unknowns = append(unknowns, k)
 	}
-	return encoder.EncodeStructFieldsAndExtensions(value)
-}
 
-// DecodeWith will be invoked by package "jsoninfo"
-func (props *ExtensionProps) DecodeWith(decoder *jsoninfo.ObjectDecoder, value interface{}) error {
-	if err := decoder.DecodeStructFieldsAndExtensions(value); err != nil {
-		return err
+	if len(unknowns) != 0 {
+		return newExtraSiblingFields(unknowns, origin)
 	}
-	source := decoder.DecodeExtensionMap()
-	result := make(map[string]interface{}, len(source))
-	for k, v := range source {
-		result[k] = v
-	}
-	props.Extensions = result
+
 	return nil
 }

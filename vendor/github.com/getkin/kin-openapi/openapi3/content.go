@@ -9,7 +9,33 @@ import (
 type Content map[string]*MediaType
 
 func NewContent() Content {
-	return make(map[string]*MediaType, 4)
+	return make(Content)
+}
+
+func NewContentWithSchema(schema *Schema, consumes []string) Content {
+	if len(consumes) == 0 {
+		return Content{
+			"*/*": NewMediaType().WithSchema(schema),
+		}
+	}
+	content := make(map[string]*MediaType, len(consumes))
+	for _, mediaType := range consumes {
+		content[mediaType] = NewMediaType().WithSchema(schema)
+	}
+	return content
+}
+
+func NewContentWithSchemaRef(schema *SchemaRef, consumes []string) Content {
+	if len(consumes) == 0 {
+		return Content{
+			"*/*": NewMediaType().WithSchemaRef(schema),
+		}
+	}
+	content := make(map[string]*MediaType, len(consumes))
+	for _, mediaType := range consumes {
+		content[mediaType] = NewMediaType().WithSchemaRef(schema)
+	}
+	return content
 }
 
 func NewContentWithJSONSchema(schema *Schema) Content {
@@ -20,6 +46,18 @@ func NewContentWithJSONSchema(schema *Schema) Content {
 func NewContentWithJSONSchemaRef(schema *SchemaRef) Content {
 	return Content{
 		"application/json": NewMediaType().WithSchemaRef(schema),
+	}
+}
+
+func NewContentWithFormDataSchema(schema *Schema) Content {
+	return Content{
+		"multipart/form-data": NewMediaType().WithSchema(schema),
+	}
+}
+
+func NewContentWithFormDataSchemaRef(schema *SchemaRef) Content {
+	return Content{
+		"multipart/form-data": NewMediaType().WithSchemaRef(schema),
 	}
 }
 
@@ -66,10 +104,12 @@ func (content Content) Get(mime string) *MediaType {
 	return content["*/*"]
 }
 
-func (content Content) Validate(c context.Context) error {
-	for _, v := range content {
-		// Validate MediaType
-		if err := v.Validate(c); err != nil {
+// Validate returns an error if Content does not comply with the OpenAPI spec.
+func (content Content) Validate(ctx context.Context, opts ...ValidationOption) error {
+	ctx = WithValidationOptions(ctx, opts...)
+
+	for _, k := range componentNames(content) {
+		if err := content[k].Validate(ctx); err != nil {
 			return err
 		}
 	}
